@@ -6,6 +6,9 @@ from typing import Dict, List
 import logging
 from dotenv import load_dotenv
 import csv
+import locale
+import pandas as pd
+from contextlib import contextmanager
 
 # Carrega variáveis do arquivo .env
 load_dotenv()
@@ -53,15 +56,20 @@ class CSVProcessor:
             logger.error(f"Erro ao conectar ao banco de dados: {e}")
             raise
 
-    def fetch_reference_data(self, query: str, params: tuple = None) -> List[Dict]:
+    def fetch_reference_data(self, query: str, key_field: str = None, params: tuple = None) -> dict:
         """
-        Busca dados de referência do banco PostgreSQL.
+        Busca dados de referência e retorna como dicionário indexado por key_field
         
-        :param query: Query SQL para executar
-        :param params: Parâmetros para a query (opcional)
-        :return: Lista de dicionários com os resultados
+        Args:
+            query: Query SQL para executar
+            key_field: Campo para usar como chave do dicionário (opcional)
+            params: Parâmetros para a query (opcional)
+            
+        Returns:
+            dict: Dicionário com os resultados indexados pela chave especificada
+                Se key_field não for especificado, retorna lista tradicional
         """
-        cache_key = f"{query}{params}"
+        cache_key = f"{query}{params}{key_field}"
         if cache_key in self.db_cache:
             return self.db_cache[cache_key]
             
@@ -71,14 +79,53 @@ class CSVProcessor:
                 cursor.execute(query, params or ())
                 columns = [desc[0] for desc in cursor.description]
                 results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+                
+                # Transforma em dicionário se key_field for especificado
+                if key_field:
+                    result_dict = {}
+                    for item in results:
+                        key = item.get(key_field)
+                        if key is not None:
+                            result_dict[key] = item
+                    self.db_cache[cache_key] = result_dict
+                    return result_dict
+                    
                 self.db_cache[cache_key] = results
                 return results
+                
         except Exception as e:
             logger.error(f"Erro ao buscar dados de referência: {e}")
             raise
         finally:
             if conn:
                 conn.close()
+                
+    def _convert_br_to_en_us(self, series):
+        """
+        Converte valores numéricos no formato brasileiro para EN-US
+        Ex: "75.000,00" → 75000.00 (float)
+            "78,57" → 78.57 (float)
+        """
+        def convert_single(value):
+            if pd.isna(value):
+                return value
+                
+            # Se já for numérico, não precisa converter
+            if isinstance(value, (int, float)):
+                return value
+                
+            # Converte para string e limpa
+            str_value = str(value).strip()
+            
+            try:
+                # Remove pontos de milhar e substitui vírgula decimal por ponto
+                clean_num = str_value.replace('.', '').replace(',', '.')
+                return float(clean_num)
+            except ValueError:
+                return value  # Mantém original se falhar a conversão
+        
+        # Aplica a conversão para cada valor da Series
+        return series.apply(convert_single)    
 
     def process_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -87,26 +134,45 @@ class CSVProcessor:
         :param df: DataFrame com os dados originais
         :return: DataFrame com os dados processados
         """
+        query = "select * from depara.codigo_pais"
+        estado_para_pais = self.fetch_reference_data(query,'estado')
+
+        tratamentos_padronizados = {
+             'CAPITAL SEGURADO (MOEDA ORIGEM)': self._convert_br_to_en_us
+            ,'VALOR ESTIMADO (US$ )': self._convert_br_to_en_us
+            ,'VALOR ESTIMADO (R$)': self._convert_br_to_en_us
+            ,'FEE (US$)': self._convert_br_to_en_us
+            ,'FEE (BRL)': self._convert_br_to_en_us
+            ,'TAXA DE CÂMBIO': self._convert_br_to_en_us
+        }
+ 
+        # 3. Processar cada coluna
         for coluna in df.columns:
-            print(f"\n=== Processando coluna: {coluna} ===")
-               
-            if 'int' in str(df[coluna].dtype):
-                # Tratamentos para colunas numéricas inteiras
-                df[coluna] = self._tratar_inteiros(df[coluna])
-                
-            elif 'float' in str(df[coluna].dtype):
-                # Tratamentos para colunas numéricas decimais
-                df[coluna] = self._tratar_decimais(df[coluna])
-                                
-            #print(f"Tipo após tratamento: {df[coluna].dtype}")
+            # Aplicar tratamento específico se a coluna estiver no dicionário
+            if coluna in tratamentos_padronizados:
+                df[coluna] = tratamentos_padronizados[coluna](df[coluna])
+            else:
+                # Tratamento genérico para colunas não mapeadas
+                df[coluna] = self._tratar_generico(df[coluna])
             
-            # Tratamentos específicos por nome de coluna (exemplos)
-            if 'referência' in coluna.lower():
-                print(df[coluna])
-                #df[coluna] = pd.to_datetime(df[coluna], errors='coerce')
-                                
+            # Tratamento especial para coluna de ESTADO
+            if 'ESTADO' in coluna.upper():
+                df['ID_PAIS'] = df[coluna].apply(
+                    lambda estado: estado_para_pais.get(str(estado).strip(), {}).get('id') 
+                    if pd.notna(estado) else None
+                )
+        
         return df
 
+
+    def _tratar_generico(self, series):
+        """
+        Limpeza genérica para colunas não mapeadas
+        """
+        if series.dtype == 'object':
+            return series.astype(str).str.strip()
+        return series
+                
     def _tratar_texto(self, serie):
         """Tratamentos genéricos para colunas de texto"""
         serie = serie.astype(str)
@@ -192,6 +258,7 @@ class CSVProcessor:
             # Processar dados
             processed_df = self.process_data(df)
             # Configurações de escrita (sem BOM na saída)
+            
             output_config = {
                 'encoding': 'utf-8',  # Sem BOM na saída
                 'quoting': int(os.getenv('OUTPUT_QUOTING', str(csv.QUOTE_NONNUMERIC))),
