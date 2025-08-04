@@ -1,0 +1,6 @@
+services:
+  app: 
+    build: .
+    environment:
+      - PYTHONUNBUFFERED=1
+
